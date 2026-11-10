@@ -2,7 +2,7 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # ---------------------------------------------------------
 
-from typing import List, Any
+from typing import Dict, List, Any, Optional, Tuple
 from unittest.mock import Mock, MagicMock, patch
 
 import httpx
@@ -15,7 +15,7 @@ from azure.ai.evaluation._evaluate._evaluate_aoai import (
     OAIEvalRunCreationInfo,
     _wait_for_run_conclusion,
 )
-from azure.ai.evaluation._exceptions import EvaluationException
+from azure.ai.evaluation._exceptions import ErrorBlame, EvaluationException
 
 
 class MockOutputItem:
@@ -33,6 +33,133 @@ class MockOutputItemsList:
     def __init__(self, data: List[MockOutputItem], has_more: bool = False):
         self.data = data
         self.has_more = has_more
+
+
+@pytest.mark.unittest
+class TestAOAIResultAlignmentSafety:
+    """Keep provider row identity when pages overlap or results arrive in fragments."""
+
+    @staticmethod
+    def _item(row_id: Any, score: float, item_id: str, grader: str = "a") -> MockOutputItem:
+        return MockOutputItem(
+            id=item_id,
+            datasource_item_id=row_id,
+            results=[{"name": grader, "score": score, "passed": True}],
+        )
+
+    @staticmethod
+    def _results(
+        pages: List[MockOutputItemsList],
+        expected: int = 3,
+        graders: Optional[Dict[str, str]] = None,
+    ) -> Tuple[pd.DataFrame, Dict[str, Any], Mock]:
+        client = Mock()
+        client.evals.runs.output_items.list.side_effect = pages
+        mapping = graders or {"a": "grade"}
+        run_info = OAIEvalRunCreationInfo(
+            client=client,
+            eval_group_id="eval-test",
+            eval_run_id="run-test",
+            grader_name_map=mapping,
+            expected_rows=expected,
+        )
+        completed = Mock(
+            status="completed",
+            per_testing_criteria_results=[Mock(testing_criteria=name, passed=expected, failed=0) for name in mapping],
+        )
+        with patch("azure.ai.evaluation._evaluate._evaluate_aoai._wait_for_run_conclusion", return_value=completed):
+            frame, metrics = _get_single_run_results(run_info)
+        return frame, metrics, client
+
+    @pytest.mark.parametrize("same_item_id", [False, True])
+    def test_consistent_duplicate_rows_keep_missing_input_position(self, same_item_id: bool) -> None:
+        first = self._item(0, 0.25, "item-0")
+        repeated = self._item(0, 0.25, "item-0" if same_item_id else "duplicate-0")
+        pages = [
+            MockOutputItemsList([first], has_more=True),
+            MockOutputItemsList([repeated, self._item(2, 0.75, "item-2")]),
+        ]
+
+        frame, metrics, client = self._results(pages)
+
+        assert frame.loc[0, "outputs.grade.score"] == 0.25
+        assert pd.isna(frame.loc[1, "outputs.grade.score"])
+        assert frame.loc[2, "outputs.grade.score"] == 0.75
+        assert frame.loc[1, "outputs.grade.row_missing"]
+        assert metrics == {"grade.pass_rate": 1.0}
+        assert client.evals.runs.output_items.list.call_args_list[1].kwargs["after"] == "item-0"
+
+    def test_complementary_criteria_merge_without_shifting_scores(self) -> None:
+        items = [
+            self._item(0, 0.2, "item-a0", "a"),
+            self._item(0, 0.3, "item-b0", "b"),
+            self._item(1, 0.9, "item-b1", "b"),
+        ]
+
+        frame, _, _ = self._results([MockOutputItemsList(items)], expected=2, graders={"a": "grade_a", "b": "grade_b"})
+
+        assert frame.loc[0, "outputs.grade_a.score"] == 0.2
+        assert pd.isna(frame.loc[1, "outputs.grade_a.score"])
+        assert frame["outputs.grade_b.score"].tolist() == [0.3, 0.9]
+
+    def test_missing_criterion_in_first_row_does_not_shift_later_result(self) -> None:
+        items = [
+            self._item(0, 0.3, "item-b0", "b"),
+            self._item(1, 0.8, "item-a1", "a"),
+        ]
+
+        frame, _, _ = self._results([MockOutputItemsList(items)], expected=2, graders={"a": "grade_a", "b": "grade_b"})
+
+        assert pd.isna(frame.loc[0, "outputs.grade_a.score"])
+        assert frame.loc[1, "outputs.grade_a.score"] == 0.8
+        assert frame.loc[0, "outputs.grade_b.score"] == 0.3
+        assert pd.isna(frame.loc[1, "outputs.grade_b.score"])
+
+    def test_conflicting_duplicates_raise_typed_response_error(self) -> None:
+        items = [self._item(0, 0.2, "first"), self._item(0, 0.9, "second")]
+
+        with pytest.raises(EvaluationException) as error:
+            self._results([MockOutputItemsList(items)], expected=1)
+
+        assert error.value.blame == ErrorBlame.UNKNOWN
+        assert "conflicting" in str(error.value).lower()
+
+    def test_reused_output_id_cannot_identify_two_inputs(self) -> None:
+        items = [self._item(0, 0.2, "same"), self._item(1, 0.9, "same")]
+
+        with pytest.raises(EvaluationException) as error:
+            self._results([MockOutputItemsList(items)], expected=2)
+
+        assert error.value.blame == ErrorBlame.UNKNOWN
+
+    @pytest.mark.parametrize("row_id", [-1, 3, None, True, "unknown"])
+    def test_invalid_source_ids_do_not_get_silently_discarded(self, row_id: Any) -> None:
+        with pytest.raises(EvaluationException) as error:
+            self._results([MockOutputItemsList([self._item(row_id, 0.5, "invalid")])])
+
+        assert error.value.blame == ErrorBlame.UNKNOWN
+
+    def test_numeric_string_source_ids_keep_expected_order(self) -> None:
+        items = [self._item("1", 0.9, "second"), self._item("0", 0.1, "first")]
+
+        frame, _, _ = self._results([MockOutputItemsList(items)], expected=2)
+
+        assert frame["outputs.grade.score"].tolist() == [0.1, 0.9]
+
+    def test_repeated_pagination_cursor_fails_instead_of_looping(self) -> None:
+        repeated = MockOutputItemsList([self._item(0, 0.5, "same")], has_more=True)
+
+        with pytest.raises(EvaluationException) as error:
+            self._results([repeated, repeated], expected=1)
+
+        assert error.value.blame == ErrorBlame.UNKNOWN
+        assert "pagination" in str(error.value).lower()
+
+    def test_empty_output_marks_each_expected_row_missing(self) -> None:
+        frame, _, _ = self._results([MockOutputItemsList([])], expected=2)
+
+        assert len(frame) == 2
+        assert frame["outputs.grade.row_missing"].tolist() == [True, True]
 
 
 class TestAOAIPagination:

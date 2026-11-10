@@ -377,6 +377,7 @@ def _get_single_run_results(
     LOGGER.info(f"AOAI: Collecting output items for run {run_info['eval_run_id']} with pagination...")
     all_results: List[Any] = []
     next_cursor: Optional[str] = None
+    seen_cursors: Set[str] = set()
     limit = 100  # Max allowed by API
 
     while True:
@@ -393,16 +394,32 @@ def _get_single_run_results(
         if hasattr(raw_list_results, "has_more") and raw_list_results.has_more:
             if hasattr(raw_list_results, "data") and len(raw_list_results.data) > 0:
                 next_cursor = raw_list_results.data[-1].id
+                if not isinstance(next_cursor, str) or not next_cursor or next_cursor in seen_cursors:
+                    raise EvaluationException(
+                        message="AOAI output-item pagination did not advance to a new cursor.",
+                        blame=ErrorBlame.UNKNOWN,
+                        category=ErrorCategory.FAILED_EXECUTION,
+                        target=ErrorTarget.AOAI_GRADER,
+                    )
+                seen_cursors.add(next_cursor)
             else:
                 break
         else:
             break
 
     LOGGER.info(f"AOAI: Collected {len(all_results)} total output items across all pages.")
-    listed_results: Dict[str, List[Any]] = {"index": []}
+    expected = run_info.get("expected_rows", None)
+    indexed_results: Dict[int, Dict[str, Any]] = {}
+    output_item_indices: Dict[str, int] = {}
     # Raw data has no order guarantees; capture datasource_item_id per row for ordering.
     for row_result in all_results:
-        listed_results["index"].append(row_result.datasource_item_id)
+        row_index = _aoai_source_row_index(row_result.datasource_item_id, expected)
+        output_id = getattr(row_result, "id", None)
+        if isinstance(output_id, str) and output_id:
+            if output_id in output_item_indices and output_item_indices[output_id] != row_index:
+                raise _aoai_result_response_error("One AOAI output item identifies conflicting input rows.")
+            output_item_indices[output_id] = row_index
+        record = indexed_results.setdefault(row_index, {"index": row_index})
         for single_grader_row_result in row_result.results:
             if isinstance(single_grader_row_result, dict):
                 result_dict = single_grader_row_result
@@ -437,45 +454,21 @@ def _get_single_run_results(
                     # Create a `_result` column for each grader
                     result_column_name = f"outputs.{grader_name}.{grader_name}_result"
                     if len(result_column_name) < 50:
-                        if result_column_name not in listed_results:
-                            listed_results[result_column_name] = []
-                        listed_results[result_column_name].append(EVALUATION_PASS_FAIL_MAPPING[value])
+                        _merge_aoai_result_value(record, result_column_name, EVALUATION_PASS_FAIL_MAPPING[value])
 
                 formatted_column_name = f"outputs.{grader_name}.{name}"
-                if formatted_column_name not in listed_results:
-                    listed_results[formatted_column_name] = []
-                listed_results[formatted_column_name].append(value)
+                _merge_aoai_result_value(record, formatted_column_name, value)
 
-    # Ensure all columns are the same length as the 'index' list
-    num_rows = len(listed_results["index"])
-    LOGGER.info(f"AOAI: Processing {num_rows} result rows into dataframe...")
-    for col_name in list(listed_results.keys()):
-        if col_name != "index":
-            col_length = len(listed_results[col_name])
-            if col_length < num_rows:
-                listed_results[col_name].extend([None] * (num_rows - col_length))
-            elif col_length > num_rows:
-                listed_results[col_name] = listed_results[col_name][:num_rows]
-
-    output_df = pd.DataFrame(listed_results)
-
-    # If the 'index' column is missing for any reason, synthesize it from the current RangeIndex.
-    if "index" not in output_df.columns:
-        output_df["index"] = list(range(len(output_df)))
-
+    LOGGER.info(f"AOAI: Processing {len(indexed_results)} unique input rows into dataframe...")
+    output_df = pd.DataFrame(list(indexed_results.values())) if indexed_results else pd.DataFrame({"index": []})
     # Deterministic ordering by original datasource_item_id
     output_df = output_df.sort_values("index", ascending=True)
-
-    # Keep a temporary row-id copy for debugging/inspection.
-    # Use underscores (not hyphens) to avoid pandas column handling quirks.
-    output_df["__azure_ai_evaluation_index"] = output_df["index"]
-
     # Preserve original ids as index, then pad to expected length
     output_df.set_index("index", inplace=True)
 
-    expected = run_info.get("expected_rows", None)
     if expected is not None:
         pre_len = len(output_df)
+        observed_indices = set(output_df.index)
         LOGGER.info(f"AOAI: Validating result count: expected {expected} rows, received {pre_len} rows.")
         # Assumes original datasource_item_id space is 0..expected-1
         output_df = output_df.reindex(range(expected))
@@ -488,24 +481,8 @@ def _get_single_run_results(
                 expected,
                 missing_rows,
             )
-            # Add a per-grader 'row_missing' boolean for padded rows
-            grader_user_names: Set[str] = set()
-            for col in output_df.columns:
-                if col.startswith("outputs."):
-                    parts = col.split(".")
-                    if len(parts) > 2:
-                        grader_user_names.add(parts[1])
-            if grader_user_names:
-                missing_index_mask = output_df.isna().all(axis=1)
-                for g in grader_user_names:
-                    col_name = f"outputs.{g}.row_missing"
-                    if col_name not in output_df:
-                        output_df[col_name] = False
-                    output_df.loc[missing_index_mask, col_name] = True
-
-    # Drop the temporary helper column before returning (no public surface change)
-    if "__azure_ai_evaluation_index" in output_df.columns:
-        output_df.drop(columns=["__azure_ai_evaluation_index"], inplace=True, errors="ignore")
+            for grader_name in set(run_info["grader_name_map"].values()):
+                output_df[f"outputs.{grader_name}.row_missing"] = ~output_df.index.isin(observed_indices)
 
     # Reset to RangeIndex so downstream concatenation aligns on position
     output_df.reset_index(drop=True, inplace=True)
@@ -513,6 +490,42 @@ def _get_single_run_results(
         f"AOAI: Successfully processed run {run_info['eval_run_id']} with final dataframe shape: {output_df.shape}"
     )
     return output_df, run_metrics
+
+
+def _aoai_result_response_error(message: str) -> EvaluationException:
+    """Keep ambiguous provider results on the typed dependency-failure path."""
+    return EvaluationException(
+        message=message,
+        blame=ErrorBlame.UNKNOWN,
+        category=ErrorCategory.FAILED_EXECUTION,
+        target=ErrorTarget.AOAI_GRADER,
+    )
+
+
+def _aoai_source_row_index(value: Any, expected: Optional[int]) -> int:
+    """Accept generated integer row identities without inventing replacement positions."""
+    if isinstance(value, str) and re.fullmatch(r"0|[1-9][0-9]*", value):
+        try:
+            value = int(value)
+        except ValueError as error:
+            raise _aoai_result_response_error("AOAI returned an invalid datasource item identifier.") from error
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < 0
+        or (expected is not None and value >= expected)
+    ):
+        raise _aoai_result_response_error("AOAI returned an invalid datasource item identifier.")
+    return value
+
+
+def _merge_aoai_result_value(record: Dict[str, Any], column: str, value: Any) -> None:
+    """Coalesce consistent fragments and reject conflicting scores rather than selecting one."""
+    if column in record and json.dumps(record[column], sort_keys=True, default=str) != json.dumps(
+        value, sort_keys=True, default=str
+    ):
+        raise _aoai_result_response_error("AOAI returned conflicting results for the same input and grader.")
+    record[column] = value
 
 
 def _convert_remote_eval_params_to_grader(grader_id: str, init_params: Dict[str, Any]) -> AzureOpenAIGrader:

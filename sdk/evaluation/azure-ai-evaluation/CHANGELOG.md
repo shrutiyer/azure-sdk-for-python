@@ -1,5 +1,11 @@
 # Release History
 
+## 1.18.13 (Unreleased)
+
+### Bugs Fixed
+
+- Fixed Azure OpenAI grader result alignment failing on duplicate datasource item IDs or shifting scores when a row omits a criterion. Consistent duplicates and complementary criterion fragments are merged by input identity; conflicting results, invalid identities, and non-advancing pagination raise typed failures. Missing inputs retain their original positions and explicit missing-row flags.
+
 ## 1.18.12 (2026-11-09)
 
 ### Bugs Fixed
